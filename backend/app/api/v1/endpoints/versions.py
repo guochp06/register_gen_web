@@ -4,6 +4,8 @@ API endpoints for version management and code generation
 import shutil
 import uuid
 import time
+import os
+import logging
 from pathlib import Path
 import asyncio
 from typing import List, Optional
@@ -30,6 +32,7 @@ from app.services.module_code_generator import ModuleCodeGenerator
 from app.core.config import settings
 
 router = APIRouter()
+logger = logging.getLogger(__name__)
 
 
 def _get_version_output_dir(version: Version) -> Path:
@@ -808,6 +811,140 @@ async def generate_code(
         status_code=400,
         detail="Please re-upload Excel files to regenerate codes"
     )
+
+
+# ============================================================================
+# PDF Download Endpoint (MUST be registered BEFORE /download/{format_type}
+# to avoid "/pdf" being captured as a format_type value)
+# ============================================================================
+
+@router.get("/versions/{version_id}/download/pdf")
+async def download_pdf(
+    version_id: int,
+    include_all_pages: bool = True,
+    db: Session = Depends(get_db)
+):
+    """
+    Generate and download PDF register documentation.
+
+    Uses Playwright (headless Chromium) to render peakrdl-html output.
+    Cached: subsequent requests return the cached PDF if HTML hasn't changed.
+
+    Args:
+        version_id: Version ID
+        include_all_pages: If True, merge all module pages into one PDF with bookmarks.
+                           If False, only render the top-level index.html.
+    """
+    import fcntl
+
+    service = VersionService(db)
+    version = service.get_version(version_id)
+    if not version:
+        raise HTTPException(status_code=404, detail="Version not found")
+
+    # ---- Check that HTML exists ----
+    html_dir = _get_version_output_dir(version) / "html"
+    html_file = html_dir / "index.html"
+    if not html_file.exists():
+        raise HTTPException(
+            status_code=400,
+            detail="HTML not yet generated. Please upload Excel and process first."
+        )
+
+    output_dir = _get_version_output_dir(version)
+    pdf_dir = output_dir / "pdf"
+    pdf_path = pdf_dir / f"{version.name}.pdf"
+    lock_path = pdf_dir / f"{version.name}.pdf.lock"
+
+    # ---- Cache check (no lock needed for reads) ----
+    if pdf_path.exists():
+        html_mtime = _get_newest_file_mtime(html_dir)
+        if pdf_path.stat().st_mtime >= html_mtime:
+            return FileResponse(
+                pdf_path,
+                media_type="application/pdf",
+                filename=f"{version.name}.pdf"
+            )
+
+    # ---- All pages mode builds bookmarks from RAL data ----
+    # Single page mode just renders the combined HTML without bookmarks
+
+    # ---- File lock: prevent duplicate generation ----
+    pdf_dir.mkdir(parents=True, exist_ok=True)
+    lock_fd = open(lock_path, 'w')
+    try:
+        fcntl.flock(lock_fd.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except BlockingIOError:
+        # Another request is generating this PDF — poll-wait for it
+        lock_fd.close()
+        for _ in range(120):
+            await asyncio.sleep(0.5)
+            if pdf_path.exists():
+                return FileResponse(
+                    pdf_path,
+                    media_type="application/pdf",
+                    filename=f"{version.name}.pdf"
+                )
+        raise HTTPException(
+            status_code=503,
+            detail="PDF generation in progress by another request, please retry in a minute."
+        )
+
+    try:
+        # ---- Double-check cache after acquiring lock ----
+        if pdf_path.exists():
+            html_mtime = _get_newest_file_mtime(html_dir)
+            if pdf_path.stat().st_mtime >= html_mtime:
+                return FileResponse(
+                    pdf_path,
+                    media_type="application/pdf",
+                    filename=f"{version.name}.pdf"
+                )
+
+        # ---- Generate PDF ----
+        from app.services.pdf_generator import generate_pdf_safe, PDFGenerationError
+
+        result_path = await generate_pdf_safe(
+            html_dir=html_dir,
+            output_dir=pdf_dir,
+            title=version.name or f"version_{version_id}"
+        )
+
+        return FileResponse(
+            result_path,
+            media_type="application/pdf",
+            filename=f"{version.name}.pdf"
+        )
+
+    except PDFGenerationError as e:
+        raise HTTPException(
+            status_code=500,
+            detail=f"PDF generation failed: {str(e)}"
+        )
+    except Exception as e:
+        logger.exception("Unexpected error during PDF generation")
+        raise HTTPException(
+            status_code=500,
+            detail=f"PDF generation failed unexpectedly: {str(e)}"
+        )
+    finally:
+        fcntl.flock(lock_fd.fileno(), fcntl.LOCK_UN)
+        lock_fd.close()
+        try:
+            os.unlink(lock_path)
+        except OSError:
+            pass
+
+
+def _get_newest_file_mtime(directory: Path) -> float:
+    """Get the most recent modification time of any file under directory."""
+    max_mtime = 0.0
+    for f in directory.rglob("*"):
+        if f.is_file():
+            mtime = f.stat().st_mtime
+            if mtime > max_mtime:
+                max_mtime = mtime
+    return max_mtime
 
 
 @router.get("/versions/{version_id}/download/{format_type}")

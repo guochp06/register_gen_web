@@ -76,6 +76,7 @@ export default function App() {
   const [uploadErrors, setUploadErrors] = useState<string[]>([])
   const [loading, setLoading] = useState(false)
   const [htmlUrl, setHtmlUrl] = useState<string | null>(null)
+  const [pdfLoading, setPdfLoading] = useState(false)
   const [activeTab, setActiveTab] = useState<'upload' | 'download'>('upload')
   const [generatedFiles, setGeneratedFiles] = useState<GeneratedFiles | null>(null)
   const [selectedModule, setSelectedModule] = useState<string>('')
@@ -441,6 +442,38 @@ export default function App() {
       window.URL.revokeObjectURL(blobUrl)
     } catch (error: any) {
       showMessage(error.response?.data?.detail || 'Download failed', 'error')
+    }
+  }
+
+  const downloadPdf = async (includeAllPages: boolean = true) => {
+    if (!selectedVersion) {
+      showMessage('Please select a version first', 'error')
+      return
+    }
+    setPdfLoading(true)
+    try {
+      const response = await axios.get(
+        `${API_BASE}/versions/${selectedVersion.id}/download/pdf`,
+        {
+          params: { include_all_pages: includeAllPages },
+          responseType: 'blob',
+          timeout: 180000  // 3 minutes for large documents
+        }
+      )
+      const blobUrl = window.URL.createObjectURL(new Blob([response.data]))
+      const link = document.createElement('a')
+      link.href = blobUrl
+      link.setAttribute('download', `${selectedVersion.name}.pdf`)
+      document.body.appendChild(link)
+      link.click()
+      link.remove()
+      window.URL.revokeObjectURL(blobUrl)
+      showMessage('PDF downloaded successfully', 'success')
+    } catch (error: any) {
+      const detail = error.response?.data?.detail || 'PDF download failed'
+      showMessage(detail, 'error')
+    } finally {
+      setPdfLoading(false)
     }
   }
 
@@ -968,6 +1001,40 @@ export default function App() {
               >
                 View {selectedVersion?.name} Register Map →
               </a>
+
+              <div style={{ marginTop: '12px', display: 'flex', gap: '10px', alignItems: 'center' }}>
+                <button
+                  onClick={() => downloadPdf(false)}
+                  disabled={pdfLoading}
+                  style={{
+                    padding: '8px 16px',
+                    background: pdfLoading ? '#999' : '#e74c3c',
+                    color: '#fff',
+                    border: 'none',
+                    borderRadius: '4px',
+                    cursor: pdfLoading ? 'not-allowed' : 'pointer',
+                    fontSize: '13px'
+                  }}
+                >
+                  {pdfLoading ? 'Generating...' : 'Download PDF'}
+                </button>
+                <button
+                  onClick={() => downloadPdf(true)}
+                  disabled={pdfLoading}
+                  style={{
+                    padding: '8px 16px',
+                    background: pdfLoading ? '#999' : '#c0392b',
+                    color: '#fff',
+                    border: 'none',
+                    borderRadius: '4px',
+                    cursor: pdfLoading ? 'not-allowed' : 'pointer',
+                    fontSize: '13px'
+                  }}
+                  title="Include all module pages with bookmark outline"
+                >
+                  {pdfLoading ? 'Generating...' : 'PDF (All Pages + Bookmarks)'}
+                </button>
+              </div>
             </div>
           </div>
         )}
